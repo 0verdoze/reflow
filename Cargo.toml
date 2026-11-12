@@ -8,7 +8,11 @@ edition = "2018"
 memflow = { version = "0.2", features = ["plugins"] }
 log = "0.4"
 unicorn-engine = "2.0"
-capstone = "0.11"
+capstone = { version = "0.11", optional = true }
+
+[features]
+# Per-instruction disassembly via `Oven::trace(true)`.
+trace = ["capstone"]
 
 [dev-dependencies]
 simplelog = "0.12"

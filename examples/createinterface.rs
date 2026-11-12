@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         .expect("unable to find CreateInterface export");
 
     let arch = process.info().proc_arch;
-    let mut execution = Oven::new(arch, &mut process).expect("unable to create oven");
+    let mut execution = Oven::new(arch, process).expect("unable to create oven");
     execution
         .stack(Stack::new().ret_addr(0x1234u64))?
         .params(Parameters::new().push_u32(0).push_str("VEngineClient014"))?

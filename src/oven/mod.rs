@@ -1,111 +1,315 @@
+#![allow(clippy::unnecessary_cast)] // casts keep `umem` builds other than u64 compiling
+
 mod architecture;
 use architecture::OvenArchitecture;
 
 use crate::params::{Parameter, Parameters};
 use crate::stack::Stack;
 
-use log::{debug, trace};
+#[cfg(feature = "trace")]
+use log::debug;
+use log::trace;
+
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::convert::TryInto;
+use std::fmt;
+use std::ptr::NonNull;
+use std::rc::Rc;
 
 use memflow::prelude::v1::*;
 
 use unicorn_engine::unicorn_const::*;
 use unicorn_engine::*;
 
-use capstone::{arch::*, *};
+#[cfg(feature = "trace")]
+use capstone::prelude::*;
 
 pub type Result<T> = std::result::Result<T, String>;
 
 const DATA_SIZE: usize = size::mb(128);
 
-pub struct Oven<'a, T: 'a> {
+/// Default value for [`Oven::max_instructions`].
+pub const DEFAULT_MAX_INSTRUCTIONS: usize = 100_000;
+
+/// Kind of memory access that hit an unmapped page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+    Fetch,
+}
+
+impl fmt::Display for Access {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Access::Read => "read",
+            Access::Write => "write",
+            Access::Fetch => "fetch",
+        })
+    }
+}
+
+/// State shared between the oven and its fault hooks.
+///
+/// The hooks only use `try_borrow*` on these cells, so a re-entrant call can
+/// never panic; it fails the access instead.
+struct FaultState {
+    page_size: u64,
+    /// Every page the fault hooks mapped from process memory.
+    pages: RefCell<BTreeSet<u64>>,
+    /// Reused page buffer, so a fault does not allocate.
+    buf: RefCell<Box<[u8]>>,
+    /// The access that could not be satisfied in the last run.
+    fault: Cell<Option<(Access, u64)>>,
+}
+
+impl FaultState {
+    /// Maps every page touched by `[addr, addr + size)` that the hooks have not mapped yet.
+    fn map_range<M: MemoryView>(
+        &self,
+        emu: &mut Unicorn<'_, ()>,
+        mem: &mut M,
+        addr: u64,
+        size: usize,
+    ) -> std::result::Result<(), &'static str> {
+        let mask = !(self.page_size - 1);
+        let first = addr & mask;
+        let last = addr.saturating_add((size.max(1) - 1) as u64) & mask;
+
+        let mut page = first;
+        loop {
+            let known = self
+                .pages
+                .try_borrow()
+                .map_err(|_| "page set is busy")?
+                .contains(&page);
+            if !known {
+                self.map_page(emu, mem, page)?;
+            }
+            if page >= last {
+                return Ok(());
+            }
+            page += self.page_size;
+        }
+    }
+
+    /// Maps one page and fills it from process memory.
+    fn map_page<M: MemoryView>(
+        &self,
+        emu: &mut Unicorn<'_, ()>,
+        mem: &mut M,
+        page: u64,
+    ) -> std::result::Result<(), &'static str> {
+        let page_size = self.page_size as usize;
+
+        // TODO: copy perms from process
+        match emu.mem_map(page, page_size, Permission::ALL) {
+            Ok(()) => {}
+            // The page overlaps the emulator's own stack or data area. Loading
+            // nothing would silently feed emulator memory to the function instead
+            // of process memory, so fail the access.
+            Err(uc_error::MAP) => return Err("address overlaps emulator stack/data area"),
+            Err(_) => return Err("unable to map memory"),
+        }
+
+        let mut buf = self
+            .buf
+            .try_borrow_mut()
+            .map_err(|_| "page buffer is busy")?;
+        let loaded = mem.read_raw_into(Address::from(page), &mut buf[..]).is_ok()
+            && emu.mem_write(page, &buf[..]).is_ok();
+        if !loaded {
+            emu.mem_unmap(page, page_size).ok();
+            return Err("unable to read page from process memory");
+        }
+
+        self.pages
+            .try_borrow_mut()
+            .map_err(|_| "page set is busy")?
+            .insert(page);
+        Ok(())
+    }
+}
+
+/// Owns the process memory behind a stable heap address.
+///
+/// This is a `Box<T>` stored as a raw pointer. A real `Box` field would be
+/// re-asserted as unique every time the oven moves, which invalidates the
+/// raw pointer the fault hooks hold under Rust's aliasing rules. Storing the
+/// pointer keeps the same ownership and drop behaviour without that problem.
+struct OwnedMem<T>(NonNull<T>);
+
+impl<T> OwnedMem<T> {
+    fn new(mem: Box<T>) -> Self {
+        Self(NonNull::from(Box::leak(mem)))
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+}
+
+impl<T> Drop for OwnedMem<T> {
+    fn drop(&mut self) {
+        // # Safety
+        // The pointer came from `Box::leak` in `new` and is freed exactly once here.
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) }
+    }
+}
+
+pub struct Oven<T: MemoryView + 'static> {
+    // NOTE: `unicorn` must be declared before `mem`. Struct fields are dropped in
+    // declaration order, so the emulator and the hook closures it owns (which hold
+    // a raw pointer to `*mem`) are dropped before the memory they point to.
+    pub(crate) unicorn: Unicorn<'static, ()>,
+    #[cfg(feature = "trace")]
+    trace_hook: Option<UcHookId>,
+    faults: Rc<FaultState>,
     arch: OvenArchitecture,
-    pub(crate) unicorn: Unicorn<'a, ()>,
+    stack: Stack,
+    areas_mapped: bool,
     data_base: u64,
     ret_addr: Address,
     entry_point: Address,
-    mem: &'a mut T,
+    max_instructions: usize,
+    mem: OwnedMem<T>,
 }
 
-impl<'a, T: 'a + MemoryView> Oven<'a, T> {
-    pub fn new(arch: ArchitectureIdent, mem: &'a mut T) -> Result<Self> {
+// # Safety
+// `Oven` is `!Send` only because of the `Rc`/`Weak` reference counts inside it:
+// the `Unicorn` handle (`Rc<UnicornInner>`), the `Weak` back-references stored in
+// each hook, and the `Rc<FaultState>` clones captured by the fault hooks. All of
+// those clones are owned by this oven and none ever leaves it:
+//   - `unicorn` is not public, `Unicorn` is not `Clone`, and the oven never hands
+//     out `&Unicorn`/`&mut Unicorn` (with `&mut Unicorn` a caller could add a hook
+//     capturing a `!Send` value, so it must stay private);
+//   - hook callbacks get a temporary `Unicorn` upgraded from the `Weak`, which is
+//     dropped before `emu_start` returns, on the thread that called it;
+//   - `faults` is private and only cloned into the hooks.
+// Moving the oven therefore moves every reference count together, and `!Sync`
+// keeps two threads from touching it at once. The C side keeps all emulator state
+// in the instance; its only thread-local (QEMU's guest RNG) is not per-instance.
+// Capstone (`trace`) has no thread-local state. `T` is `Send` via `MemoryView`.
+unsafe impl<T: MemoryView + 'static> Send for Oven<T> {}
+
+impl<T: MemoryView + 'static> Oven<T> {
+    pub fn new(arch: ArchitectureIdent, mem: T) -> Result<Self> {
         let arch: OvenArchitecture = arch.try_into()?;
         let unicorn = Unicorn::new(
             arch.unicorn_arch(),
             arch.unicorn_mode() | arch.unicorn_endianess(),
         )
         .map_err(|_| "failed to instantiate emulator")?;
-        let data_base = arch.max_writable_addr() - DATA_SIZE as u64 + 1;
+        let page_size = unicorn
+            .query(Query::PAGE_SIZE)
+            .map_err(|_| "unable to query emulator page size")?;
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(format!("invalid emulator page size 0x{:x}", page_size));
+        }
+
+        let data_base = Self::data_start(&arch);
         Self {
-            arch,
             unicorn,
+            #[cfg(feature = "trace")]
+            trace_hook: None,
+            faults: Rc::new(FaultState {
+                page_size: page_size as u64,
+                pages: RefCell::new(BTreeSet::new()),
+                buf: RefCell::new(vec![0u8; page_size].into_boxed_slice()),
+                fault: Cell::new(None),
+            }),
+            arch,
+            stack: Stack::new(),
+            areas_mapped: false,
             data_base,
             ret_addr: Address::NULL,
             entry_point: Address::NULL,
-            mem,
+            max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            mem: OwnedMem::new(Box::new(mem)),
         }
         .install_hooks()
     }
 
-    #[allow(clippy::unnecessary_cast)]
-    pub fn stack(&mut self, stack: Stack) -> Result<&mut Self> {
-        self.data_base = self.arch.max_writable_addr() - DATA_SIZE as u64 + 1;
+    /// The process memory owned by this oven.
+    pub fn mem(&mut self) -> &mut T {
+        // # Safety
+        // `mem` is valid for the lifetime of `self`, and `&mut self` guarantees no
+        // hook runs while this borrow is alive (hooks only run inside `emu_start`).
+        unsafe { &mut *self.mem.as_ptr() }
+    }
 
-        // initialize memory for stack if needed
-        if self
-            .unicorn
-            .mem_protect(
-                stack.base as u64,
-                stack.size as usize,
-                Permission::READ | Permission::WRITE,
-            )
-            .is_err()
-        {
-            self.unicorn
-                .mem_map(
-                    stack.base as u64,
-                    stack.size as usize,
-                    Permission::READ | Permission::WRITE,
-                )
-                .map_err(|e| {
-                    println!("{:?}", e);
-                    "unable to map memory at stack base"
-                })?;
+    /// Maximum number of instructions a single `reflow()` may execute
+    /// (default 100 000, `0` = unlimited).
+    pub fn max_instructions(&mut self, count: usize) -> &mut Self {
+        self.max_instructions = count;
+        self
+    }
+
+    /// Enables or disables per-instruction disassembly (logged at debug level).
+    #[cfg(feature = "trace")]
+    pub fn trace(&mut self, enabled: bool) -> Result<&mut Self> {
+        match (enabled, self.trace_hook) {
+            (true, None) => {
+                let mode = if self.arch.ptr_size() == 8 {
+                    arch::x86::ArchMode::Mode64
+                } else {
+                    arch::x86::ArchMode::Mode32
+                };
+                let cs = Capstone::new()
+                    .x86()
+                    .mode(mode)
+                    .syntax(arch::x86::ArchSyntax::Intel)
+                    .build()
+                    .map_err(|_| "unable to create capstone context")?;
+                let id = self
+                    .unicorn
+                    .add_code_hook(1, 0, move |uc, addr, size| {
+                        if let Ok(code) = uc.mem_read_as_vec(addr, size as usize) {
+                            if let Ok(insns) = cs.disasm_all(&code, addr) {
+                                debug!("{}", insns.to_string().trim_end());
+                            }
+                        }
+                    })
+                    .map_err(|_| "unable to create unicorn code hook")?;
+                self.trace_hook = Some(id);
+            }
+            (false, Some(id)) => {
+                self.unicorn
+                    .remove_hook(id)
+                    .map_err(|_| "unable to remove unicorn code hook")?;
+                self.trace_hook = None;
+            }
+            _ => {}
         }
-
-        // initialize high memory for data stored on stack / regs
-        if self
-            .unicorn
-            .mem_protect(
-                self.data_base as u64,
-                DATA_SIZE,
-                Permission::READ | Permission::WRITE,
-            )
-            .is_err()
-        {
-            self.unicorn
-                .mem_map(
-                    self.data_base,
-                    DATA_SIZE,
-                    Permission::READ | Permission::WRITE,
-                )
-                .map_err(|_| "unable to map high memory for data references")?;
-        }
-
-        // TODO: allow reexecution and 0 stack
-
-        // write stack to rsp
-        let stack_start_addr = stack.base + stack.size as u64;
-        self.unicorn
-            .reg_write(self.arch.reg_sp(), stack_start_addr)
-            .map_err(|_| "unable to write rsp register")?;
-
-        self.ret_addr = stack.ret_addr.into();
-
         Ok(self)
     }
 
-    pub fn params(&mut self, params: Parameters<'a>) -> Result<&mut Self> {
+    #[allow(clippy::unnecessary_cast)]
+    pub fn stack(&mut self, stack: Stack) -> Result<&mut Self> {
+        self.stack = stack;
+        self.map_areas()?;
+        self.reset_frame(self.stack.ret_addr)?;
+        Ok(self)
+    }
+
+    /// Prepares the next call: resets the stack pointer to the stack top and
+    /// rewinds the data area. Stack and data are mapped on first use only.
+    ///
+    /// `ret_addr` must be non-zero and should point to unmapped memory
+    /// (e.g. `0xDEAD_0000`); execution stops when it is reached.
+    pub fn prepare_call(&mut self, ret_addr: u64) -> Result<&mut Self> {
+        if ret_addr == 0 {
+            return Err("return address must be non-zero".into());
+        }
+        if !self.areas_mapped {
+            self.map_areas()?;
+        }
+        self.reset_frame(ret_addr)?;
+        Ok(self)
+    }
+
+    pub fn params(&mut self, params: Parameters<'_>) -> Result<&mut Self> {
         for param in params.entries.iter() {
             match param {
                 Parameter::Push32(value) => {
@@ -127,14 +331,10 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
                 }
 
                 Parameter::Reg32(reg, value) => {
-                    self.unicorn
-                        .reg_write(*reg as i32, *value as u64)
-                        .map_err(|_| "unable to write rsp register")?;
+                    self.set_reg(*reg, *value as u64)?;
                 }
                 Parameter::Reg64(reg, value) => {
-                    self.unicorn
-                        .reg_write(*reg as i32, *value)
-                        .map_err(|_| "unable to write rsp register")?;
+                    self.set_reg(*reg, *value)?;
                 }
                 Parameter::RegStr(reg, value) => {
                     let nullstr = format!("{}\0", value);
@@ -143,6 +343,9 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
                 Parameter::RegString(reg, value) => {
                     let nullstr = format!("{}\0", value);
                     self.write_data_to_reg(*reg, nullstr.as_bytes())?;
+                }
+                Parameter::RegBytes(reg, value) => {
+                    self.write_arg(*reg, value)?;
                 }
                 Parameter::RegBuf(reg, size) => {
                     self.buf_to_reg(*reg, *size)?;
@@ -157,6 +360,51 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
         Ok(self)
     }
 
+    /// Writes `value` into `reg`.
+    pub fn set_reg(&mut self, reg: RegisterX86, value: u64) -> Result<&mut Self> {
+        self.unicorn
+            .reg_write(reg as i32, value)
+            .map_err(|_| "unable to write register")?;
+        Ok(self)
+    }
+
+    /// Copies `bytes` into the data area, puts their address into `reg` and
+    /// advances the data area, aligned up to 16. No terminator is added.
+    pub fn write_arg(&mut self, reg: RegisterX86, bytes: &[u8]) -> Result<&mut Self> {
+        let addr = self.data_base;
+        let next = (addr + bytes.len() as u64 + 15) & !15;
+        if next > Self::data_start(&self.arch) + DATA_SIZE as u64 {
+            return Err("data area exhausted".into());
+        }
+        self.unicorn
+            .mem_write(addr, bytes)
+            .map_err(|_| "unable to write argument into data area")?;
+        self.unicorn
+            .reg_write(reg as i32, addr)
+            .map_err(|_| "unable to write register")?;
+        self.data_base = next;
+        Ok(self)
+    }
+
+    /// Pushes the Windows x64 home space (4 × u64, zeroed). Call it right before
+    /// `reflow()`, which pushes the return address, so `rsp % 16 == 8` on entry.
+    pub fn push_shadow_space(&mut self) -> Result<&mut Self> {
+        const SHADOW: [u8; 32] = [0; 32];
+        let sp = self
+            .unicorn
+            .reg_read(self.arch.reg_sp())
+            .map_err(|_| "unable to read sp register")?
+            .checked_sub(SHADOW.len() as u64)
+            .ok_or("stack overflow")?;
+        self.unicorn
+            .mem_write(sp, &SHADOW)
+            .map_err(|_| "unable to write shadow space")?;
+        self.unicorn
+            .reg_write(self.arch.reg_sp(), sp)
+            .map_err(|_| "unable to write sp register")?;
+        Ok(self)
+    }
+
     pub fn entry_point(&mut self, entry_point: Address) -> Result<&mut Self> {
         self.entry_point = entry_point;
         Ok(self)
@@ -164,8 +412,11 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
 
     pub fn reflow(&mut self) -> Result<()> {
         self.finalize_stack()?;
-        //self.map_from_mem(&mut self.mem, self.entry_point.to_umem())?;
         self.execute()
+    }
+
+    pub fn reg_read_u8(&self, reg: RegisterX86) -> Result<u8> {
+        Ok(self.reg_read_u64(reg)? as u8)
     }
 
     pub fn reg_read_u64(&self, reg: RegisterX86) -> Result<u64> {
@@ -187,7 +438,122 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
         )
     }
 
+    /// Unmaps every page the fault hooks loaded from process memory, so the
+    /// next call reads fresh data. Stack and data areas stay mapped.
+    pub fn invalidate(&mut self) -> Result<()> {
+        self.unmap_faulted(|_| false)
+    }
+
+    /// Like [`invalidate`](Self::invalidate), but keeps pages that overlap
+    /// `[base, base + size)`, e.g. the module holding the code and constants.
+    pub fn invalidate_keep(&mut self, base: impl Into<Address>, size: umem) -> Result<()> {
+        let lo = base.into().to_umem() as u64;
+        let hi = lo.saturating_add(size as u64);
+        let page_size = self.faults.page_size;
+        self.unmap_faulted(|page| page < hi && page.saturating_add(page_size) > lo)
+    }
+
+    /// Number of pages currently mapped from process memory.
+    pub fn mapped_page_count(&self) -> usize {
+        self.faults.pages.try_borrow().map(|p| p.len()).unwrap_or(0)
+    }
+
     // TODO: more helper functions
+
+    /// Stack base in use: the explicit `Stack::base`, or the architecture default.
+    pub fn stack_base(&self) -> Result<u64> {
+        if self.stack.size == 0 || self.stack.size > DATA_SIZE as u64 * 8 {
+            return Err(format!("invalid stack size 0x{:x}", self.stack.size));
+        }
+        Ok(self.stack.base.unwrap_or_else(|| {
+            self.arch
+                .default_stack_base(self.stack.size, Self::data_start(&self.arch))
+        }))
+    }
+
+    fn data_start(arch: &OvenArchitecture) -> u64 {
+        arch.max_writable_addr() - DATA_SIZE as u64 + 1
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn map_areas(&mut self) -> Result<()> {
+        let stack_base = self.stack_base()?;
+        // initialize memory for stack if needed
+        if self
+            .unicorn
+            .mem_protect(
+                stack_base,
+                self.stack.size as usize,
+                Permission::READ | Permission::WRITE,
+            )
+            .is_err()
+        {
+            self.unicorn
+                .mem_map(
+                    stack_base,
+                    self.stack.size as usize,
+                    Permission::READ | Permission::WRITE,
+                )
+                .map_err(|_| "unable to map memory at stack base")?;
+        }
+
+        // initialize high memory for data stored on stack / regs
+        let data_start = Self::data_start(&self.arch);
+        if self
+            .unicorn
+            .mem_protect(data_start, DATA_SIZE, Permission::READ | Permission::WRITE)
+            .is_err()
+        {
+            self.unicorn
+                .mem_map(data_start, DATA_SIZE, Permission::READ | Permission::WRITE)
+                .map_err(|_| "unable to map high memory for data references")?;
+        }
+
+        self.areas_mapped = true;
+        Ok(())
+    }
+
+    fn reset_frame(&mut self, ret_addr: u64) -> Result<()> {
+        self.data_base = Self::data_start(&self.arch);
+
+        // write stack top to rsp
+        let stack_start_addr = self.stack_base()? + self.stack.size;
+        self.unicorn
+            .reg_write(self.arch.reg_sp(), stack_start_addr)
+            .map_err(|_| "unable to write rsp register")?;
+
+        self.ret_addr = ret_addr.into();
+        Ok(())
+    }
+
+    fn unmap_faulted(&mut self, keep: impl Fn(u64) -> bool) -> Result<()> {
+        let page_size = self.faults.page_size as usize;
+        let unicorn = &mut self.unicorn;
+        let mut pages = self
+            .faults
+            .pages
+            .try_borrow_mut()
+            .map_err(|_| "page set is busy")?;
+
+        let mut failed = None;
+        pages.retain(|&page| {
+            if keep(page) {
+                return true;
+            }
+            match unicorn.mem_unmap(page, page_size) {
+                Ok(()) => false,
+                Err(_) => {
+                    failed.get_or_insert(page);
+                    true // still tracked, so a later invalidate can retry
+                }
+            }
+        });
+
+        match failed {
+            Some(page) => Err(format!("unable to unmap page at 0x{:x}", page)),
+            None => Ok(()),
+        }
+    }
 
     fn finalize_stack(&mut self) -> Result<()> {
         // push final ret addr, this execution must be called after stack has been setup
@@ -196,24 +562,6 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
     }
 
     fn install_hooks(mut self) -> Result<Self> {
-        // disasm code hook
-        if log::log_enabled!(log::Level::Debug) {
-            let cs = Capstone::new()
-                .x86()
-                .mode(arch::x86::ArchMode::Mode64)
-                .syntax(arch::x86::ArchSyntax::Intel)
-                .detail(true)
-                .build()
-                .map_err(|_| "unable to create capstone context".to_string())?;
-            self.unicorn
-                .add_code_hook(1, 0, move |uc, addr, size| {
-                    let instructions = uc.mem_read_as_vec(addr, size as usize).unwrap();
-                    let result = cs.disasm_all(&instructions, addr).unwrap();
-                    debug!("{}", result.to_string().trim_end());
-                })
-                .map_err(|_| "unable to create unicorn code hook".to_string())?;
-        }
-
         // fetch prot hook
         // TODO: implement real protection from memory
         self.unicorn
@@ -224,86 +572,63 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
             .map_err(|_| "unable to create unicorn mem prot hook".to_string())?;
 
         // hooks for data reload
-        let mem_ptr = self.mem as *mut _ as *mut ();
-        self.unicorn
-            .add_mem_hook(
-                HookType::MEM_FETCH_UNMAPPED,
-                1,
-                0,
-                move |emu, ty, addr, size, _| {
+        for (hook_type, access) in [
+            (HookType::MEM_FETCH_UNMAPPED, Access::Fetch),
+            (HookType::MEM_READ_UNMAPPED, Access::Read),
+            (HookType::MEM_WRITE_UNMAPPED, Access::Write),
+        ] {
+            let mem_ptr = self.mem.as_ptr();
+            let faults = self.faults.clone();
+            self.unicorn
+                .add_mem_hook(hook_type, 1, 0, move |emu, ty, addr, size, _| {
                     trace!("{:?}: 0x{:x} with size 0x{:x}", ty, addr, size);
 
                     // # Safety
-                    // This is safe because the `Process` does not outlive the underlying `emu` context.
-                    // Callbacks will only be executed for a given `emu` and as long as it exists.
-                    let mem = unsafe { &mut *(mem_ptr as *mut T) };
-                    map_from_mem(emu, mem, addr).ok();
-
-                    true
-                },
-            )
-            .map_err(|_| "unable to create unicorn mem fetch hook".to_string())?;
-
-        self.unicorn
-            .add_mem_hook(
-                HookType::MEM_READ_UNMAPPED,
-                1,
-                0,
-                move |emu, ty, addr, size, _| {
-                    trace!("{:?}: 0x{:x} with size 0x{:x}", ty, addr, size);
-
-                    // # Safety
-                    // This is safe because the `Process` does not outlive the underlying `emu` context.
-                    // Callbacks will only be executed for a given `emu` and as long as it exists.
-                    let mem = unsafe { &mut *(mem_ptr as *mut T) };
-                    map_from_mem(emu, mem, addr).ok();
-
-                    true
-                },
-            )
-            .map_err(|_| "unable to create unicorn read unmapped hook".to_string())?;
-
-        self.unicorn
-            .add_mem_hook(
-                HookType::MEM_WRITE_UNMAPPED,
-                1,
-                0,
-                move |emu, ty, addr, size, _| {
-                    trace!("{:?}: 0x{:x} with size 0x{:x}", ty, addr, size);
-
-                    // # Safety
-                    // This is safe because the `Process` does not outlive the underlying `emu` context.
-                    // Callbacks will only be executed for a given `emu` and as long as it exists.
-                    let mem = unsafe { &mut *(mem_ptr as *mut T) };
-                    map_from_mem(emu, mem, addr).ok();
-
-                    true
-                },
-            )
-            .map_err(|_| "unable to create unicorn write unmapped hook".to_string())?;
-
-        // hook for memory access debugging
-        self.unicorn
-            .add_mem_hook(HookType::MEM_READ, 1, 0, move |_, _, addr, size, _| {
-                trace!("read at 0x{:x} with size {:x}", addr, size);
-                true
-            })
-            .map_err(|_| "unable to create unicorn mem read hook".to_string())?;
-
-        self.unicorn
-            .add_mem_hook(HookType::MEM_WRITE, 1, 0, |_, _, addr, size, _| {
-                trace!("write at 0x{:x} with size {:x}", addr, size);
-                true
-            })
-            .map_err(|_| "unable to create unicorn mem write hook".to_string())?;
+                    // `mem` is heap-allocated, never moves and is dropped after the
+                    // emulator (see the field order of `Oven`). Hooks only run inside
+                    // `emu_start`, which holds `&mut Oven`, so nothing else borrows it.
+                    let mem = unsafe { &mut *mem_ptr };
+                    match faults.map_range(emu, mem, addr, size) {
+                        Ok(()) => true,
+                        Err(_) => {
+                            faults.fault.set(Some((access, addr)));
+                            // stop emulation; `emu_start` returns the error
+                            false
+                        }
+                    }
+                })
+                .map_err(|_| "unable to create unicorn unmapped memory hook".to_string())?;
+        }
 
         Ok(self)
     }
 
     fn execute(&mut self) -> Result<()> {
-        self.unicorn
-            .emu_start(self.entry_point.to_umem(), self.ret_addr.to_umem(), 0, 0)
-            .map_err(|err| format!("unable to execute unicorn context: {:?}", err))?;
+        self.faults.fault.set(None);
+        let ret = self.ret_addr.to_umem() as u64;
+
+        if let Err(err) = self.unicorn.emu_start(
+            self.entry_point.to_umem() as u64,
+            ret,
+            0,
+            self.max_instructions,
+        ) {
+            return Err(match self.faults.fault.take() {
+                Some((access, addr)) => format!("unmapped {} at 0x{:x}", access, addr),
+                None => format!("unable to execute unicorn context: {:?}", err),
+            });
+        }
+
+        let pc = self
+            .unicorn
+            .pc_read()
+            .map_err(|_| "unable to read instruction pointer")?;
+        if pc != ret {
+            return Err(format!(
+                "did not return within {} instructions (pc = 0x{:x})",
+                self.max_instructions, pc
+            ));
+        }
         Ok(())
     }
 
@@ -316,7 +641,9 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
             return Err("stack overflow");
         }*/
 
-        sp -= self.arch.ptr_size() as u64;
+        sp = sp
+            .checked_sub(self.arch.ptr_size() as u64)
+            .ok_or("stack overflow")?;
 
         let mode = self.arch.unicorn_mode();
         if mode.contains(unicorn_const::Mode::MODE_32) {
@@ -329,7 +656,7 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
                 .mem_write(sp, value.as_bytes())
                 .map_err(|_| "unable to write memory at sp")?;
         } else {
-            unreachable!("invalid architecture");
+            return Err("invalid architecture".into());
         }
 
         self.unicorn
@@ -398,8 +725,12 @@ impl<'a, T: 'a + MemoryView> Oven<'a, T> {
         Ok(())
     }
 
+    /// Maps the page containing `addr` from `process`. The page is tracked like
+    /// a faulted page, so `invalidate()` unmaps it again.
     pub fn map_from_mem(&mut self, process: &mut impl MemoryView, addr: u64) -> Result<()> {
-        map_from_mem(&mut self.unicorn, process, addr)
+        self.faults
+            .map_range(&mut self.unicorn, process, addr, 1)
+            .map_err(|e| format!("{} at 0x{:x}", e, addr))
     }
 }
 
@@ -408,9 +739,14 @@ pub fn map_from_mem(
     process: &mut impl MemoryView,
     addr: u64,
 ) -> Result<()> {
-    let page_size = emu.query(unicorn_const::Query::PAGE_SIZE).unwrap();
+    let page_size = emu
+        .query(unicorn_const::Query::PAGE_SIZE)
+        .map_err(|_| "unable to query emulator page size")?;
     let page_addr = Address::from(addr).as_page_aligned(page_size);
-    let page = process.read_raw(page_addr, page_size).unwrap();
+    let mut page = vec![0u8; page_size];
+    process
+        .read_raw_into(page_addr, &mut page)
+        .map_err(|_| format!("unable to read memory at 0x{:x}", page_addr.to_umem()))?;
 
     // TODO: copy perms from process
     emu.mem_map(page_addr.to_umem(), page_size, Permission::ALL)

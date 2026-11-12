@@ -5,7 +5,7 @@ pub mod stack;
 
 pub mod prelude {
     pub mod v1 {
-        pub use crate::oven::Oven;
+        pub use crate::oven::{Oven, DEFAULT_MAX_INSTRUCTIONS};
         pub use crate::params::Parameters;
         pub use crate::result::Result;
         pub use crate::stack::Stack;

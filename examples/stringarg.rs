@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     let module = process.module_by_name("example_stringargs.exe").unwrap();
 
     let arch = process.info().proc_arch;
-    let mut execution = Oven::new(arch, &mut process).expect("unable to create oven");
+    let mut execution = Oven::new(arch, process).expect("unable to create oven");
     execution
         .stack(Stack::new().ret_addr(0xDEADBEEFu64))?
         .entry_point(module.base + 0x112f3)?;

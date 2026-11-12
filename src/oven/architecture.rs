@@ -23,7 +23,7 @@ impl TryFrom<ArchitectureIdent> for OvenArchitecture {
                 ident,
                 obj: ident.into_obj(),
             }),
-            ArchitectureIdent::X86(_, _) => unreachable!("invalid x86 bit width"),
+            ArchitectureIdent::X86(_, _) => Err("invalid x86 bit width"),
             ArchitectureIdent::AArch64(_) => Err("AArch64 is not supported yet"),
             ArchitectureIdent::Unknown(_) => Err("Unknown process architecture"),
         }
@@ -58,8 +58,23 @@ impl OvenArchitecture {
     pub fn max_writable_addr(&self) -> u64 {
         match self.ident {
             ArchitectureIdent::X86(32, _) => u32::MAX as u64 - size::mb(1) as u64,
-            ArchitectureIdent::X86(64, _) => u64::MAX as u64 - size::gb(1) as u64,
+            // Unicorn masks x86-64 guest addresses to 52 bits, so anything above
+            // that cannot be reached by emulated code. Stay just below 2^52, which
+            // is also above all Windows user-mode addresses (<= 0x7FFF_FFFF_FFFF).
+            ArchitectureIdent::X86(64, _) => (1u64 << 52) - 1 - size::gb(1) as u64,
             _ => unreachable!("invalid architecture"),
+        }
+    }
+
+    /// Default stack base for a stack of `size` bytes whose top must stay below
+    /// `data_start`, leaving an unmapped guard gap in between.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn default_stack_base(&self, size: u64, data_start: u64) -> u64 {
+        match self.ident {
+            ArchitectureIdent::X86(64, _) => {
+                (data_start - size::mb(1) as u64 - size) & !(size::kb(4) as u64 - 1)
+            }
+            _ => size::mb(1) as u64,
         }
     }
 

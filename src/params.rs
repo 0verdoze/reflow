@@ -12,6 +12,8 @@ pub enum Parameter<'a> {
     Reg64(RegisterX86, u64),
     RegStr(RegisterX86, &'a str),
     RegString(RegisterX86, String),
+    /// Bytes copied into the data area as-is (no terminator), address in the register.
+    RegBytes(RegisterX86, &'a [u8]),
     RegBuf(RegisterX86, usize),
     MovReg(RegisterX86, RegisterX86),
 }
@@ -70,6 +72,11 @@ impl<'a> Parameters<'a> {
 
     pub fn reg_string(mut self, reg: RegisterX86, value: String) -> Self {
         self.entries.push(Parameter::RegString(reg, value));
+        self
+    }
+
+    pub fn reg_bytes(mut self, reg: RegisterX86, value: &'a [u8]) -> Self {
+        self.entries.push(Parameter::RegBytes(reg, value));
         self
     }
 
