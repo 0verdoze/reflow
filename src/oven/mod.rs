@@ -104,7 +104,7 @@ impl FaultState {
         let page_size = self.page_size as usize;
 
         // TODO: copy perms from process
-        match emu.mem_map(page, page_size, Permission::ALL) {
+        match emu.mem_map(page, page_size as u64, Prot::ALL) {
             Ok(()) => {}
             // The page overlaps the emulator's own stack or data area. Loading
             // nothing would silently feed emulator memory to the function instead
@@ -120,7 +120,7 @@ impl FaultState {
         let loaded = mem.read_raw_into(Address::from(page), &mut buf[..]).is_ok()
             && emu.mem_write(page, &buf[..]).is_ok();
         if !loaded {
-            emu.mem_unmap(page, page_size).ok();
+            emu.mem_unmap(page, page_size as u64).ok();
             return Err("unable to read page from process memory");
         }
 
@@ -483,16 +483,16 @@ impl<T: MemoryView + 'static> Oven<T> {
             .unicorn
             .mem_protect(
                 stack_base,
-                self.stack.size as usize,
-                Permission::READ | Permission::WRITE,
+                self.stack.size as u64,
+                Prot::READ | Prot::WRITE,
             )
             .is_err()
         {
             self.unicorn
                 .mem_map(
                     stack_base,
-                    self.stack.size as usize,
-                    Permission::READ | Permission::WRITE,
+                    self.stack.size as u64,
+                    Prot::READ | Prot::WRITE,
                 )
                 .map_err(|_| "unable to map memory at stack base")?;
         }
@@ -501,11 +501,11 @@ impl<T: MemoryView + 'static> Oven<T> {
         let data_start = Self::data_start(&self.arch);
         if self
             .unicorn
-            .mem_protect(data_start, DATA_SIZE, Permission::READ | Permission::WRITE)
+            .mem_protect(data_start, DATA_SIZE as u64, Prot::READ | Prot::WRITE)
             .is_err()
         {
             self.unicorn
-                .mem_map(data_start, DATA_SIZE, Permission::READ | Permission::WRITE)
+                .mem_map(data_start, DATA_SIZE as u64, Prot::READ | Prot::WRITE)
                 .map_err(|_| "unable to map high memory for data references")?;
         }
 
@@ -540,7 +540,7 @@ impl<T: MemoryView + 'static> Oven<T> {
             if keep(page) {
                 return true;
             }
-            match unicorn.mem_unmap(page, page_size) {
+            match unicorn.mem_unmap(page, page_size as u64) {
                 Ok(()) => false,
                 Err(_) => {
                     failed.get_or_insert(page);
@@ -645,18 +645,19 @@ impl<T: MemoryView + 'static> Oven<T> {
             .checked_sub(self.arch.ptr_size() as u64)
             .ok_or("stack overflow")?;
 
-        let mode = self.arch.unicorn_mode();
-        if mode.contains(unicorn_const::Mode::MODE_32) {
-            let value32 = value as u32;
-            self.unicorn
-                .mem_write(sp, value32.as_bytes())
-                .map_err(|_| "unable to write memory at sp")?;
-        } else if mode.contains(unicorn_const::Mode::MODE_64) {
-            self.unicorn
-                .mem_write(sp, value.as_bytes())
-                .map_err(|_| "unable to write memory at sp")?;
-        } else {
-            return Err("invalid architecture".into());
+        match self.arch.ptr_size() {
+            4 => {
+                let value32 = value as u32;
+                self.unicorn
+                    .mem_write(sp, value32.as_bytes())
+                    .map_err(|_| "unable to write memory at sp")?;
+            }
+            8 => {
+                self.unicorn
+                    .mem_write(sp, value.as_bytes())
+                    .map_err(|_| "unable to write memory at sp")?;
+            }
+            _ => return Err("invalid architecture".into()),
         }
 
         self.unicorn
@@ -749,7 +750,7 @@ pub fn map_from_mem(
         .map_err(|_| format!("unable to read memory at 0x{:x}", page_addr.to_umem()))?;
 
     // TODO: copy perms from process
-    emu.mem_map(page_addr.to_umem(), page_size, Permission::ALL)
+    emu.mem_map(page_addr.to_umem() as u64, page_size as u64, Prot::ALL)
         .map_err(|_| "unable to map memory")?;
     emu.mem_write(page_addr.to_umem(), &page)
         .map_err(|_| "unable to write memory".into())
