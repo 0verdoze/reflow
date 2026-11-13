@@ -336,3 +336,43 @@ fn stack_can_be_moved() {
         assert!(probe(&mut oven, SHAPE, &sphere(5)).unwrap());
     }
 }
+
+/// `mov ecx, 1000; L: dec ecx; jnz L; ret` -- about 2000 instructions.
+const LOOP_2000: &[u8] = &[0xB9, 0xE8, 0x03, 0x00, 0x00, 0xFF, 0xC9, 0x75, 0xFC, 0xC3];
+
+fn run_loop(oven: &mut Oven<FakeMem>) -> reflow::oven::Result<()> {
+    oven.prepare_call(RET_SENTINEL)?;
+    oven.push_shadow_space()?;
+    oven.entry_point(CODE.into())?;
+    oven.reflow()
+}
+
+#[test]
+fn limit_is_enforced_after_switching_from_zero() {
+    let mut mem = FakeMem::default();
+    mem.put(CODE, LOOP_2000);
+    let mut oven = Oven::new(x64(), mem).unwrap();
+
+    oven.max_instructions(10);
+    assert!(run_loop(&mut oven).is_err());
+
+    // unlimited: the loop runs (and gets translated without the counter)
+    oven.max_instructions(0);
+    run_loop(&mut oven).unwrap();
+
+    // back to a limit: the cached, uncounted code must not bypass it
+    oven.max_instructions(10);
+    let err = run_loop(&mut oven).unwrap_err();
+    assert!(
+        err.contains("did not return within 10 instructions"),
+        "{}",
+        err
+    );
+    assert!(run_loop(&mut oven).is_err());
+
+    // changing between non-zero limits works without flushing
+    oven.max_instructions(5000);
+    run_loop(&mut oven).unwrap();
+    oven.max_instructions(10);
+    assert!(run_loop(&mut oven).is_err());
+}

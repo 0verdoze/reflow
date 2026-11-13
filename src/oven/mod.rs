@@ -226,6 +226,8 @@ pub struct Oven<T: MemoryView + 'static> {
     ret_addr: Address,
     entry_point: Address,
     max_instructions: usize,
+    /// Whether Unicorn's instruction-counting hook was active in the last run.
+    counting: bool,
     /// Stack pointer kept on the host side between `prepare_call` and `reflow`,
     /// written to the emulator once before it runs. `None`: read the register.
     sp: Option<u64>,
@@ -286,6 +288,7 @@ impl<T: MemoryView + 'static> Oven<T> {
             ret_addr: Address::NULL,
             entry_point: Address::NULL,
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            counting: false,
             sp: None,
             stack_area: None,
             data_area: None,
@@ -303,7 +306,11 @@ impl<T: MemoryView + 'static> Oven<T> {
     }
 
     /// Maximum number of instructions a single `reflow()` may execute
-    /// (default 100 000, `0` = unlimited).
+    /// (default 100 000, `0` = unlimited). Takes effect at the next `reflow()`.
+    ///
+    /// Switching between limits is cheap. Switching to or from `0` makes the
+    /// next `reflow()` discard translated code once, because Unicorn only counts
+    /// instructions in code translated while counting is on.
     pub fn max_instructions(&mut self, count: usize) -> &mut Self {
         self.max_instructions = count;
         self
@@ -336,12 +343,20 @@ impl<T: MemoryView + 'static> Oven<T> {
                     })
                     .map_err(|_| "unable to create unicorn code hook")?;
                 self.trace_hook = Some(id);
+                // code translated before the hook existed would not be traced
+                self.unicorn
+                    .ctl_flush_tb()
+                    .map_err(|_| "unable to flush translated code")?;
             }
             (false, Some(id)) => {
                 self.unicorn
                     .remove_hook(id)
                     .map_err(|_| "unable to remove unicorn code hook")?;
                 self.trace_hook = None;
+                // drop code that still calls into the removed hook
+                self.unicorn
+                    .ctl_flush_tb()
+                    .map_err(|_| "unable to flush translated code")?;
             }
             _ => {}
         }
@@ -729,6 +744,18 @@ impl<T: MemoryView + 'static> Oven<T> {
     fn execute(&mut self) -> Result<()> {
         self.faults.fault.set(None);
         let ret = self.ret_addr.to_umem() as u64;
+
+        // Unicorn adds its counting hook inside `emu_start` but does not flush
+        // code translated while the hook was absent, so that code would run
+        // uncounted and the limit would be ignored. (Turning counting off is
+        // handled by Unicorn itself, which flushes in that case.)
+        let counting = self.max_instructions != 0;
+        if counting && !self.counting {
+            self.unicorn
+                .ctl_flush_tb()
+                .map_err(|_| "unable to flush translated code")?;
+        }
+        self.counting = counting;
 
         if let Err(err) = self.unicorn.emu_start(
             self.entry_point.to_umem() as u64,
