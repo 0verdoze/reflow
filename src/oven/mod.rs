@@ -158,6 +158,59 @@ impl<T> Drop for OwnedMem<T> {
     }
 }
 
+/// Guest memory backed by a host buffer the oven owns (`uc_mem_map_ptr`), so the
+/// oven fills the stack and data area with plain copies instead of `uc_mem_write`.
+///
+/// Kept as a raw pointer for the same aliasing reason as `OwnedMem`: Unicorn
+/// writes through its own pointer to the buffer while the oven holds it. Only
+/// the oven's stack and data live here, never code, so host writes do not need
+/// to invalidate translated blocks.
+struct HostArea {
+    base: u64,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl HostArea {
+    fn map(emu: &mut Unicorn<'_, ()>, base: u64, len: u64, perms: Prot) -> std::result::Result<Self, uc_error> {
+        let buf: Box<[u8]> = vec![0u8; len as usize].into_boxed_slice();
+        let len = buf.len();
+        // # Safety
+        // `buf` is leaked here and freed in `drop`; `Oven` drops `unicorn` (and
+        // with it the mapping) before its `HostArea`s, see the field order.
+        let ptr = NonNull::new(Box::leak(buf).as_mut_ptr()).expect("non-null box");
+        if let Err(e) = unsafe { emu.mem_map_ptr(base, len as u64, perms, ptr.as_ptr() as *mut _) } {
+            unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr.as_ptr(), len))) };
+            return Err(e);
+        }
+        Ok(Self { base, ptr, len })
+    }
+
+    fn matches(&self, base: u64, len: u64) -> bool {
+        self.base == base && self.len as u64 == len
+    }
+
+    /// Copies `bytes` to guest address `addr` if the whole range lies inside.
+    fn write(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        let off = match addr.checked_sub(self.base) {
+            Some(off) if off <= self.len as u64 && bytes.len() as u64 <= self.len as u64 - off => off,
+            _ => return false,
+        };
+        // # Safety
+        // In bounds (checked above); no emulation runs while `&mut Oven` is held.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(off as usize), bytes.len()) };
+        true
+    }
+}
+
+impl Drop for HostArea {
+    fn drop(&mut self) {
+        // # Safety
+        // Allocated as a boxed slice of `len` bytes in `map`, freed exactly once.
+        unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len))) }
+    }
+}
+
 pub struct Oven<T: MemoryView + 'static> {
     // NOTE: `unicorn` must be declared before `mem`. Struct fields are dropped in
     // declaration order, so the emulator and the hook closures it owns (which hold
@@ -173,6 +226,13 @@ pub struct Oven<T: MemoryView + 'static> {
     ret_addr: Address,
     entry_point: Address,
     max_instructions: usize,
+    /// Stack pointer kept on the host side between `prepare_call` and `reflow`,
+    /// written to the emulator once before it runs. `None`: read the register.
+    sp: Option<u64>,
+    // Host-backed stack and data area. Declared after `unicorn` so the emulator
+    // (and its mappings) is dropped before the buffers.
+    stack_area: Option<HostArea>,
+    data_area: Option<HostArea>,
     mem: OwnedMem<T>,
 }
 
@@ -226,6 +286,9 @@ impl<T: MemoryView + 'static> Oven<T> {
             ret_addr: Address::NULL,
             entry_point: Address::NULL,
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            sp: None,
+            stack_area: None,
+            data_area: None,
             mem: OwnedMem::new(Box::new(mem)),
         }
         .install_hooks()
@@ -362,6 +425,10 @@ impl<T: MemoryView + 'static> Oven<T> {
 
     /// Writes `value` into `reg`.
     pub fn set_reg(&mut self, reg: RegisterX86, value: u64) -> Result<&mut Self> {
+        if reg as i32 == self.arch.reg_sp() {
+            self.sp = Some(value);
+            return Ok(self);
+        }
         self.unicorn
             .reg_write(reg as i32, value)
             .map_err(|_| "unable to write register")?;
@@ -371,19 +438,46 @@ impl<T: MemoryView + 'static> Oven<T> {
     /// Copies `bytes` into the data area, puts their address into `reg` and
     /// advances the data area, aligned up to 16. No terminator is added.
     pub fn write_arg(&mut self, reg: RegisterX86, bytes: &[u8]) -> Result<&mut Self> {
+        let addr = self.write_data(bytes)?;
+        self.set_reg(reg, addr)
+    }
+
+    /// Copies `bytes` into the data area and returns their guest address. The
+    /// data area advances, aligned up to 16. No terminator is added.
+    pub fn write_data(&mut self, bytes: &[u8]) -> Result<u64> {
         let addr = self.data_base;
         let next = (addr + bytes.len() as u64 + 15) & !15;
         if next > Self::data_start(&self.arch) + DATA_SIZE as u64 {
             return Err("data area exhausted".into());
         }
-        self.unicorn
-            .mem_write(addr, bytes)
+        self.write_mem(addr, bytes)
             .map_err(|_| "unable to write argument into data area")?;
-        self.unicorn
-            .reg_write(reg as i32, addr)
-            .map_err(|_| "unable to write register")?;
         self.data_base = next;
+        Ok(addr)
+    }
+
+    /// Pushes one pointer-sized word (truncated to 32 bits on x86).
+    pub fn push(&mut self, value: u64) -> Result<&mut Self> {
+        self.push_to_stack(value)?;
         Ok(self)
+    }
+
+    /// Reads guest memory as the emulated code sees it. Process pages that are
+    /// not mapped yet are loaded (and stay mapped until `invalidate`), so later
+    /// calls read the same snapshot the emulated code runs on.
+    pub fn read_mem(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        if self.unicorn.mem_read(addr, buf).is_ok() {
+            return Ok(());
+        }
+        // # Safety
+        // See `mem()`: no hook runs while `&mut self` is held.
+        let mem = unsafe { &mut *self.mem.as_ptr() };
+        self.faults
+            .map_range(&mut self.unicorn, mem, addr, buf.len())
+            .map_err(|e| format!("{} at 0x{:x}", e, addr))?;
+        self.unicorn
+            .mem_read(addr, buf)
+            .map_err(|_| format!("unable to read memory at 0x{:x}", addr))
     }
 
     /// Pushes the Windows x64 home space (4 × u64, zeroed). Call it right before
@@ -391,17 +485,12 @@ impl<T: MemoryView + 'static> Oven<T> {
     pub fn push_shadow_space(&mut self) -> Result<&mut Self> {
         const SHADOW: [u8; 32] = [0; 32];
         let sp = self
-            .unicorn
-            .reg_read(self.arch.reg_sp())
-            .map_err(|_| "unable to read sp register")?
+            .current_sp()?
             .checked_sub(SHADOW.len() as u64)
             .ok_or("stack overflow")?;
-        self.unicorn
-            .mem_write(sp, &SHADOW)
+        self.write_mem(sp, &SHADOW)
             .map_err(|_| "unable to write shadow space")?;
-        self.unicorn
-            .reg_write(self.arch.reg_sp(), sp)
-            .map_err(|_| "unable to write sp register")?;
+        self.sp = Some(sp);
         Ok(self)
     }
 
@@ -420,6 +509,11 @@ impl<T: MemoryView + 'static> Oven<T> {
     }
 
     pub fn reg_read_u64(&self, reg: RegisterX86) -> Result<u64> {
+        if let Some(sp) = self.sp {
+            if reg as i32 == self.arch.reg_sp() {
+                return Ok(sp);
+            }
+        }
         self.unicorn
             .reg_read(reg as i32)
             .map_err(|_| "unable to read register".into())
@@ -478,38 +572,69 @@ impl<T: MemoryView + 'static> Oven<T> {
     #[allow(clippy::unnecessary_cast)]
     fn map_areas(&mut self) -> Result<()> {
         let stack_base = self.stack_base()?;
-        // initialize memory for stack if needed
-        if self
-            .unicorn
-            .mem_protect(
-                stack_base,
-                self.stack.size as u64,
-                Prot::READ | Prot::WRITE,
-            )
-            .is_err()
-        {
-            self.unicorn
-                .mem_map(
-                    stack_base,
-                    self.stack.size as u64,
-                    Prot::READ | Prot::WRITE,
-                )
-                .map_err(|_| "unable to map memory at stack base")?;
+        let stack_size = self.stack.size as u64;
+        if !matches!(&self.stack_area, Some(a) if a.matches(stack_base, stack_size)) {
+            if let Some(old) = self.stack_area.take() {
+                self.unicorn
+                    .mem_unmap(old.base, old.len as u64)
+                    .map_err(|_| "unable to unmap previous stack")?;
+            }
+            self.stack_area = Some(
+                HostArea::map(&mut self.unicorn, stack_base, stack_size, Prot::READ | Prot::WRITE)
+                    .map_err(|_| "unable to map memory at stack base")?,
+            );
         }
 
         // initialize high memory for data stored on stack / regs
         let data_start = Self::data_start(&self.arch);
-        if self
-            .unicorn
-            .mem_protect(data_start, DATA_SIZE as u64, Prot::READ | Prot::WRITE)
-            .is_err()
-        {
-            self.unicorn
-                .mem_map(data_start, DATA_SIZE as u64, Prot::READ | Prot::WRITE)
-                .map_err(|_| "unable to map high memory for data references")?;
+        if self.data_area.is_none() {
+            self.data_area = Some(
+                HostArea::map(&mut self.unicorn, data_start, DATA_SIZE as u64, Prot::READ | Prot::WRITE)
+                    .map_err(|_| "unable to map high memory for data references")?,
+            );
         }
 
         self.areas_mapped = true;
+        Ok(())
+    }
+
+    /// Writes guest memory, through the host buffer when the range lies in the
+    /// stack or data area.
+    fn write_mem(&mut self, addr: u64, bytes: &[u8]) -> std::result::Result<(), uc_error> {
+        if let Some(area) = self.stack_area.as_mut() {
+            if area.write(addr, bytes) {
+                return Ok(());
+            }
+        }
+        if let Some(area) = self.data_area.as_mut() {
+            if area.write(addr, bytes) {
+                return Ok(());
+            }
+        }
+        self.unicorn.mem_write(addr, bytes)
+    }
+
+    fn current_sp(&mut self) -> Result<u64> {
+        match self.sp {
+            Some(sp) => Ok(sp),
+            None => {
+                let sp = self
+                    .unicorn
+                    .reg_read(self.arch.reg_sp())
+                    .map_err(|_| "unable to read sp register")?;
+                self.sp = Some(sp);
+                Ok(sp)
+            }
+        }
+    }
+
+    /// Writes the host-side stack pointer to the emulator.
+    fn flush_sp(&mut self) -> Result<()> {
+        if let Some(sp) = self.sp.take() {
+            self.unicorn
+                .reg_write(self.arch.reg_sp(), sp)
+                .map_err(|_| "unable to write sp register")?;
+        }
         Ok(())
     }
 
@@ -518,9 +643,7 @@ impl<T: MemoryView + 'static> Oven<T> {
 
         // write stack top to rsp
         let stack_start_addr = self.stack_base()? + self.stack.size;
-        self.unicorn
-            .reg_write(self.arch.reg_sp(), stack_start_addr)
-            .map_err(|_| "unable to write rsp register")?;
+        self.sp = Some(stack_start_addr);
 
         self.ret_addr = ret_addr.into();
         Ok(())
@@ -558,7 +681,7 @@ impl<T: MemoryView + 'static> Oven<T> {
     fn finalize_stack(&mut self) -> Result<()> {
         // push final ret addr, this execution must be called after stack has been setup
         self.push_to_stack(self.ret_addr.to_umem())?;
-        Ok(())
+        self.flush_sp()
     }
 
     fn install_hooks(mut self) -> Result<Self> {
@@ -633,44 +756,25 @@ impl<T: MemoryView + 'static> Oven<T> {
     }
 
     fn push_to_stack(&mut self, value: u64) -> Result<()> {
-        let mut sp = self
-            .unicorn
-            .reg_read(self.arch.reg_sp())
-            .map_err(|_| "unable to read sp register")?;
-        /*if rsp + (size_of::<u64>() as u64) > self.base + self.size {
-            return Err("stack overflow");
-        }*/
-
-        sp = sp
+        let sp = self
+            .current_sp()?
             .checked_sub(self.arch.ptr_size() as u64)
             .ok_or("stack overflow")?;
 
-        match self.arch.ptr_size() {
-            4 => {
-                let value32 = value as u32;
-                self.unicorn
-                    .mem_write(sp, value32.as_bytes())
-                    .map_err(|_| "unable to write memory at sp")?;
-            }
-            8 => {
-                self.unicorn
-                    .mem_write(sp, value.as_bytes())
-                    .map_err(|_| "unable to write memory at sp")?;
-            }
+        let written = match self.arch.ptr_size() {
+            4 => self.write_mem(sp, (value as u32).as_bytes()),
+            8 => self.write_mem(sp, value.as_bytes()),
             _ => return Err("invalid architecture".into()),
-        }
+        };
+        written.map_err(|_| "unable to write memory at sp")?;
 
-        self.unicorn
-            .reg_write(self.arch.reg_sp(), sp)
-            .map_err(|_| "unable to write sp register")?;
-
+        self.sp = Some(sp);
         Ok(())
     }
 
     fn push_data_ref_to_stack(&mut self, data: &[u8]) -> Result<()> {
         // store in data section
-        self.unicorn
-            .mem_write(self.data_base, data)
+        self.write_mem(self.data_base, data)
             .map_err(|_| "unable to write string into high mem")?;
 
         // push ptr ref to stack
@@ -690,39 +794,27 @@ impl<T: MemoryView + 'static> Oven<T> {
 
     fn write_data_to_reg(&mut self, reg: RegisterX86, data: &[u8]) -> Result<()> {
         // store in data section
-        self.unicorn
-            .mem_write(self.data_base, data)
+        self.write_mem(self.data_base, data)
             .map_err(|_| "unable to write string into high mem")?;
 
-        // push ptr ref to stack
-        self.unicorn
-            .reg_write(reg as i32, self.data_base)
-            .map_err(|_| "unable to write register")?;
+        // put the data's address into the register
+        self.set_reg(reg, self.data_base)?;
 
         self.data_base += data.len() as u64;
         Ok(())
     }
 
     fn buf_to_reg(&mut self, reg: RegisterX86, size: usize) -> Result<()> {
-        // push ptr ref to stack
-        self.unicorn
-            .reg_write(reg as i32, self.data_base)
-            .map_err(|_| "unable to write register")?;
+        // put the buffer's address into the register
+        self.set_reg(reg, self.data_base)?;
 
         self.data_base += size as u64;
         Ok(())
     }
 
     fn mov_reg(&mut self, from: RegisterX86, to: RegisterX86) -> Result<()> {
-        let val = self
-            .unicorn
-            .reg_read(from as i32)
-            .map_err(|_| "unable to read register")?;
-
-        self.unicorn
-            .reg_write(to as i32, val)
-            .map_err(|_| "unable to write register")?;
-
+        let val = self.reg_read_u64(from)?;
+        self.set_reg(to, val)?;
         Ok(())
     }
 

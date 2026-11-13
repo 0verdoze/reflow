@@ -269,3 +269,70 @@ fn traced_oven_moves_between_threads() {
     .unwrap();
     assert!(probe(&mut oven, SHAPE, &sphere(4)).unwrap());
 }
+
+#[test]
+fn write_data_matches_write_arg() {
+    let mut oven = cmp_oven(7);
+    for (val, want) in [(7u32, true), (8, false)] {
+        oven.prepare_call(RET_SENTINEL).unwrap();
+        let addr = oven.write_data(&sphere(val)).unwrap();
+        assert_eq!(addr % 16, 0);
+        oven.set_reg(RegisterX86::RCX, SHAPE).unwrap();
+        oven.set_reg(RegisterX86::RDX, addr).unwrap();
+        oven.push_shadow_space().unwrap();
+        oven.entry_point(CODE.into()).unwrap();
+        oven.reflow().unwrap();
+        assert_eq!(oven.reg_read_u8(RegisterX86::RAX).unwrap() != 0, want);
+    }
+}
+
+#[test]
+fn stack_pointer_reads_back_before_reflow() {
+    let mut oven = cmp_oven(1);
+    oven.prepare_call(RET_SENTINEL).unwrap();
+    let top = oven.stack_base().unwrap() + 31 * 1024 * 1024;
+    assert_eq!(oven.reg_read_u64(RegisterX86::RSP).unwrap(), top);
+    oven.push(0x1122).unwrap();
+    oven.push_shadow_space().unwrap();
+    assert_eq!(oven.reg_read_u64(RegisterX86::RSP).unwrap(), top - 8 - 32);
+}
+
+#[test]
+fn custom_rsp_reaches_the_emulator() {
+    // mov rax, rsp; ret
+    let mut mem = FakeMem::default();
+    mem.put(CODE, &[0x48, 0x89, 0xE0, 0xC3]);
+    let mut oven = Oven::new(x64(), mem).unwrap();
+    oven.prepare_call(RET_SENTINEL).unwrap();
+    let top = oven.reg_read_u64(RegisterX86::RSP).unwrap();
+    oven.set_reg(RegisterX86::RSP, top - 0x100).unwrap();
+    oven.push_shadow_space().unwrap();
+    oven.entry_point(CODE.into()).unwrap();
+    oven.reflow().unwrap();
+    // on entry: shadow space and the return address below the custom rsp
+    assert_eq!(oven.reg_read_u64(RegisterX86::RAX).unwrap(), top - 0x100 - 32 - 8);
+}
+
+#[test]
+fn read_mem_sees_process_memory_and_keeps_the_page() {
+    let mut oven = cmp_oven(0xabcd);
+    assert_eq!(oven.mapped_page_count(), 0);
+    let mut b = [0u8; 4];
+    oven.read_mem(SHAPE + 8, &mut b).unwrap();
+    assert_eq!(u32::from_le_bytes(b), 0xabcd);
+    assert_eq!(oven.mapped_page_count(), 1);
+    // the call then runs on the same, already mapped page
+    assert!(probe(&mut oven, SHAPE, &sphere(0xabcd)).unwrap());
+    assert_eq!(oven.mapped_page_count(), 2, "code page + shape page");
+    assert!(oven.read_mem(BAD, &mut b).is_err());
+}
+
+#[test]
+fn stack_can_be_moved() {
+    let mut oven = cmp_oven(5);
+    for base in [0x1000_0000u64, 0x3000_0000, 0x1000_0000] {
+        oven.stack(Stack::new().base(base).ret_addr(RET_SENTINEL)).unwrap();
+        assert_eq!(oven.stack_base().unwrap(), base);
+        assert!(probe(&mut oven, SHAPE, &sphere(5)).unwrap());
+    }
+}
